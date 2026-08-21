@@ -3440,12 +3440,18 @@ fn convert_proto_rewards(
                 1 => RewardType::Rent,
                 2 => RewardType::Staking,
                 3 => RewardType::Voting,
-                typ => {
-                    return Err(Box::new(std::io::Error::other(format!(
-                        "unsupported reward type {}",
-                        typ
-                    ))));
-                }
+                // A reward type this build does not know is skipped, not
+                // fatal. The chain gained `DeactivatedStake` in
+                // solana-reward-info 6.3.0 (July 2026); it is proto type 5 and
+                // it appears from epoch 1017 on. This tree pins
+                // solana-reward-info 3, so the whole rewards node failed to
+                // decode, the firehose retried the node, and a scan of a
+                // current epoch produced no rows at all.
+                //
+                // Dropping one reward costs a rewards consumer one row.
+                // Failing the node costs every consumer the whole block, and
+                // every transaction in it.
+                _ => continue,
             },
             lamports: proto_reward.lamports,
             post_balance: proto_reward.post_balance,
