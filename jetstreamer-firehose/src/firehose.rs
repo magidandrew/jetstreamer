@@ -3723,6 +3723,7 @@ mod steal_protocol_tests {
 }
 
 // Uses the same Old Faithful archive as the other firehose integration tests.
+#[cfg(test)]
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn test_stolen_lower_range_keeps_callbacks_after_recycle() {
