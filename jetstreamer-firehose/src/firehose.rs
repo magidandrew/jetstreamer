@@ -1643,7 +1643,8 @@ where
             );
             let log_target = format!("{}::T{:03}", LOG_MODULE, thread_index);
             let mut skip_until_index = None;
-            let last_emitted_slot = slot_range.start.saturating_sub(1);
+            // Keep the watermark across retries; reset it only for a new assignment/epoch.
+            let mut last_emitted_slot = slot_range.start.saturating_sub(1);
             let block_enabled = on_block.is_some();
             let tx_enabled = on_tx.is_some();
             let entry_enabled = on_entry.is_some();
@@ -1655,7 +1656,6 @@ where
                     .or_insert_with(|| DashSet::with_hasher(ahash::RandomState::new()));
             }
             let mut last_counted_slot = slot_range.start.saturating_sub(1);
-            let mut last_emitted_slot_global = slot_range.start.saturating_sub(1);
             // Reverse-mode state preserved across retries. `None` for the highest remaining
             // epoch explicitly means "every epoch is complete" — required so completing
             // epoch 0 is distinguishable from epoch 0 still pending.
@@ -1687,7 +1687,6 @@ where
             let mut retry_backoff = RetryBackoff::new();
             // let mut triggered = false;
             while let Err((err, slot)) = async {
-                let mut last_emitted_slot = last_emitted_slot_global;
                 let op_timeout = if sequential_mode {
                     OP_TIMEOUT_SEQUENTIAL
                 } else {
@@ -2598,7 +2597,7 @@ where
                         thread_activity::clear_finished(thread_index);
                         slot_range = stolen;
                         last_counted_slot = slot_range.start.saturating_sub(1);
-                        last_emitted_slot_global = slot_range.start.saturating_sub(1);
+                        last_emitted_slot = slot_range.start.saturating_sub(1);
                         reverse_partial_resume = None;
                         skip_until_index = None;
                         if let Some(ref mut stats) = thread_stats {
@@ -2705,7 +2704,6 @@ where
                 // is reset to 0 each epoch restart. Keeping it can skip large portions
                 // of the stream and silently drop slots.
                 skip_until_index = None;
-                last_emitted_slot_global = last_emitted_slot;
                 if !recycled {
                     let backoff = retry_backoff.next_delay(slot);
                     log::warn!(
@@ -3722,6 +3720,106 @@ mod steal_protocol_tests {
         assert_eq!(range.end, 1200);
         assert_eq!(ledger.end.load(Ordering::SeqCst), 1200);
     }
+}
+
+// Uses the same Old Faithful archive as the other firehose integration tests.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_stolen_lower_range_keeps_callbacks_after_recycle() {
+    use std::collections::BTreeSet;
+    use tokio::sync::Notify;
+
+    const END: u64 = 376_273_723;
+    const SPLIT: u64 = END - 100;
+    let release_victim = Arc::new(Notify::new());
+    let victim_paused = Arc::new(AtomicBool::new(false));
+    let transaction_slots = Arc::new(Mutex::new(BTreeSet::new()));
+    let block_slots = Arc::new(Mutex::new(BTreeSet::new()));
+    let first_stolen_slot = Arc::new(AtomicU64::new(0));
+
+    let run = firehose(
+        2,
+        false,
+        false,
+        None,
+        (END - 200)..END,
+        Some({
+            let release_victim = release_victim.clone();
+            let block_slots = block_slots.clone();
+            let first_stolen_slot = first_stolen_slot.clone();
+            move |thread_id: usize, block: BlockData| {
+                let release_victim = release_victim.clone();
+                let victim_paused = victim_paused.clone();
+                let block_slots = block_slots.clone();
+                let first_stolen_slot = first_stolen_slot.clone();
+                async move {
+                    if thread_id == 0 {
+                        // Leave enough lower slots to steal when worker 1 finishes.
+                        if !victim_paused.swap(true, Ordering::SeqCst) {
+                            release_victim.notified().await;
+                        }
+                        sleep(std::time::Duration::from_millis(20)).await;
+                    } else if block.slot() == END - 1 {
+                        release_victim.notify_one();
+                    } else if block.slot() < SPLIT && !block.was_skipped() {
+                        block_slots.lock().unwrap().insert(block.slot());
+                        if first_stolen_slot
+                            .compare_exchange(0, block.slot(), Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                        {
+                            thread_activity::request_recycle(thread_id);
+                        }
+                    }
+                    Ok(())
+                }
+                .boxed()
+            }
+        }),
+        Some({
+            let transaction_slots = transaction_slots.clone();
+            move |thread_id: usize, transaction: TransactionData| {
+                let transaction_slots = transaction_slots.clone();
+                async move {
+                    if thread_id == 1 && transaction.slot < SPLIT {
+                        transaction_slots.lock().unwrap().insert(transaction.slot);
+                    }
+                    Ok(())
+                }
+                .boxed()
+            }
+        }),
+        None::<OnEntryFn>,
+        None::<OnRewardFn>,
+        None::<OnErrorFn>,
+        None::<OnStatsTrackingFn>,
+        None,
+    );
+    timeout(std::time::Duration::from_secs(180), run)
+        .await
+        .expect("steal/recycle run timed out")
+        .expect("firehose failed");
+
+    assert!(thread_activity::steal_count() > 0);
+    assert!(thread_activity::recycle_count() > 0);
+    let first = first_stolen_slot.load(Ordering::SeqCst);
+    assert!(
+        first > 0,
+        "worker 1 must emit a stolen block before recycling"
+    );
+    let transactions = transaction_slots.lock().unwrap();
+    let blocks = block_slots.lock().unwrap();
+    assert!(
+        transactions.iter().any(|slot| *slot > first),
+        "transactions must continue after recycling"
+    );
+    assert!(
+        blocks.iter().any(|slot| *slot > first),
+        "blocks must continue after recycling"
+    );
+    assert!(
+        transactions.is_subset(&blocks),
+        "every stolen transaction slot needs a block callback"
+    );
 }
 
 #[cfg(test)]
