@@ -1150,6 +1150,44 @@ mod rewards_decode_tests {
     }
 
     #[test]
+    fn skips_unknown_reward_types_without_losing_known_rewards() {
+        let proto = solana_storage_proto::convert::generated::Rewards {
+            rewards: [1, 5, 2, 99, 3, 0, 4]
+                .into_iter()
+                .map(
+                    |reward_type| solana_storage_proto::convert::generated::Reward {
+                        pubkey: vote_program_id().to_string(),
+                        lamports: 5,
+                        post_balance: 10,
+                        reward_type,
+                        commission: "1".to_string(),
+                    },
+                )
+                .collect(),
+            num_partitions: Some(solana_storage_proto::convert::generated::NumPartitions {
+                num_partitions: 2,
+            }),
+        };
+        let bytes = prost_011::Message::encode_to_vec(&proto);
+        let decoded = decode_rewards_from_bytes(1017 * 432000, &bytes).expect("decode rewards");
+        let types: Vec<_> = decoded
+            .keyed_rewards
+            .iter()
+            .map(|(_, reward)| reward.reward_type)
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                RewardType::Fee,
+                RewardType::Rent,
+                RewardType::Staking,
+                RewardType::Voting
+            ]
+        );
+        assert_eq!(decoded.num_partitions, Some(2));
+    }
+
+    #[test]
     fn decodes_bincode_rewards() {
         let pubkey = vote_program_id().to_string();
         let reward = Reward {
