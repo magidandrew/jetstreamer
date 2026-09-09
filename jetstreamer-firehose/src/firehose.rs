@@ -1643,7 +1643,6 @@ where
             );
             let log_target = format!("{}::T{:03}", LOG_MODULE, thread_index);
             let mut skip_until_index = None;
-            // Keep the watermark across retries; reset it only for a new assignment/epoch.
             let mut last_emitted_slot = slot_range.start.saturating_sub(1);
             let block_enabled = on_block.is_some();
             let tx_enabled = on_tx.is_some();
@@ -2227,7 +2226,6 @@ where
                                         if block_enabled
                                             && let Some(on_block_cb) = on_block.as_ref()
                                             && skipped_slot > last_emitted_slot {
-                                                last_emitted_slot = skipped_slot;
                                                 on_block_cb(
                                                     thread_index,
                                                     BlockData::PossibleLeaderSkipped {
@@ -2238,9 +2236,10 @@ where
                                                 .map_err(|e| {
                                                     (
                                                         FirehoseError::BlockHandlerError(e),
-                                                        error_slot,
+                                                        skipped_slot,
                                                     )
                                                 })?;
+                                                last_emitted_slot = skipped_slot;
                                             }
                                         if tracking_enabled {
                                             overall_slots_processed.fetch_add(1, Ordering::Relaxed);
@@ -2282,7 +2281,6 @@ where
                                                 num_partitions,
                                             } = std::mem::take(&mut this_block_rewards);
                                             if slot > last_emitted_slot {
-                                                last_emitted_slot = slot;
                                                 on_block_cb(
                                                     thread_index,
                                                     BlockData::Block {
@@ -2308,6 +2306,7 @@ where
                                                         error_slot,
                                                     )
                                                 })?;
+                                                last_emitted_slot = slot;
                                             }
                                         }
                                     } else {
@@ -3722,7 +3721,6 @@ mod steal_protocol_tests {
     }
 }
 
-// Uses the same Old Faithful archive as the other firehose integration tests.
 #[cfg(test)]
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
@@ -4540,11 +4538,73 @@ async fn test_firehose_restart_loses_coverage_without_reset() {
     .await
     .unwrap();
 
+    assert!(FAIL_TRIGGERED.load(Ordering::SeqCst));
     let coverage = COVERAGE.get().unwrap().lock().unwrap();
     for slot in START_SLOT..(START_SLOT + NUM_SLOTS) {
-        assert!(
-            coverage.contains_key(&slot),
-            "missing coverage for slot {slot} after restart"
+        assert_eq!(
+            coverage.get(&slot).copied(),
+            Some(1),
+            "slot {slot} must be handled successfully once after restart"
+        );
+    }
+}
+
+#[cfg(test)]
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_firehose_retries_failed_skipped_slot_callback() {
+    use std::collections::HashMap;
+
+    // The existing gap-coverage test identifies 378864396..400 as skipped slots.
+    const START: u64 = 378_864_395;
+    const END: u64 = 378_864_402;
+    const FAILED_SLOT: u64 = 378_864_397;
+    let attempts = Arc::new(Mutex::new(HashMap::<u64, u32>::new()));
+
+    let run = firehose(
+        1,
+        false,
+        false,
+        None,
+        START..END,
+        Some({
+            let attempts = attempts.clone();
+            move |_thread_id: usize, block: BlockData| {
+                let attempts = attempts.clone();
+                async move {
+                    let mut attempts = attempts.lock().unwrap();
+                    let count = attempts.entry(block.slot()).or_default();
+                    *count += 1;
+                    if block.slot() == FAILED_SLOT {
+                        assert!(block.was_skipped());
+                        if *count == 1 {
+                            return Err("synthetic skipped-slot handler failure".into());
+                        }
+                    }
+                    Ok(())
+                }
+                .boxed()
+            }
+        }),
+        None::<OnTxFn>,
+        None::<OnEntryFn>,
+        None::<OnRewardFn>,
+        None::<OnErrorFn>,
+        None::<OnStatsTrackingFn>,
+        None,
+    );
+    timeout(std::time::Duration::from_secs(180), run)
+        .await
+        .expect("skipped-slot retry run timed out")
+        .expect("firehose failed");
+
+    let attempts = attempts.lock().unwrap();
+    for slot in START..END {
+        let expected = if slot == FAILED_SLOT { 2 } else { 1 };
+        assert_eq!(
+            attempts.get(&slot).copied(),
+            Some(expected),
+            "only the failed callback should be retried; slot {slot}"
         );
     }
 }
